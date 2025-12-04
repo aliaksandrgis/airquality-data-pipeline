@@ -5,7 +5,6 @@ import logging
 import random
 import time
 from datetime import datetime, timedelta, timezone
-import time
 from typing import Any, Dict, List
 
 import requests
