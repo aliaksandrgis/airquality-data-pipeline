@@ -786,7 +786,6 @@ def _fetch_gios_latest() -> List[Dict[str, Any]]:  # type: ignore[redefined-oute
                         sensors_page = candidates[0]
                     else:
                         sensors_page = raw.get("data") or raw.get("sensors") or []
-                    pag = raw.get("links") or {}
                     # totalPages может лежать в meta или корне
                     meta = raw.get("meta") or {}
                     if isinstance(meta, dict) and "totalPages" in meta:
