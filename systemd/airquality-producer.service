@@ -1,0 +1,16 @@
+[Unit]
+Description=AirQuality data producer (DE/NL/PL -> Kafka)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pc
+WorkingDirectory=/home/pc/airquality-data-pipeline
+ExecStart=/bin/bash /home/pc/airquality-data-pipeline/scripts/run_producer.sh app.main
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

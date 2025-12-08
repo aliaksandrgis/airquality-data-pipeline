@@ -36,6 +36,29 @@ docker build -t airquality-data-pipeline:dev .
 docker run --env-file .env airquality-data-pipeline:dev
 ```
 
+## Raspberry Pi / systemd
+Для постоянного запуска на Pi3/4:
+
+1. Настройте `.env` и виртуальное окружение (`python -m venv .venv && source .venv/bin/activate; pip install -r requirements.txt`).
+2. Сделайте файл запуска исполняемым: `chmod +x scripts/run_producer.sh`. Скрипт принимает имя python-модуля (по умолчанию `app.main`), активирует venv, загружает `.env` и пишет логи в `logs/<module>.log`. Например:
+   ```bash
+   scripts/run_producer.sh app.de_stations
+   scripts/run_producer.sh app.de_measurements
+   scripts/run_producer.sh app.nl_stations
+   scripts/run_producer.sh app.nl_measurements
+   scripts/run_producer.sh app.pl_stations
+   scripts/run_producer.sh app.pl_measurements
+   ```
+   Airflow/cron может вызывать те же команды для оркестрации отдельных шагов.
+3. Скопируйте `systemd/airquality-producer.service` в `/etc/systemd/system/` и поправьте `User`/`WorkingDirectory` при необходимости.
+4. Примените unit:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable airquality-producer.service
+   sudo systemctl start airquality-producer.service
+   ```
+   Логи доступны через `journalctl -u airquality-producer -f`.
+
 ## CI (template)
 - Lint with `ruff` (or flake8), then run `pytest`, then build the container image.
 - Kafka/Confluent secrets are passed via GitHub Actions secrets; never commit real keys.
