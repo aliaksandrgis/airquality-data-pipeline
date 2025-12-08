@@ -27,7 +27,7 @@ python -m app.pl_measurements
 - `KAFKA_TOPIC` - target topic with raw measurements (default `airquality.raw`).
 - `PIPELINE_LIVE_API` - `true` to use real DE/NL/PL APIs, `false` to emit synthetic demo data.
 - `PIPELINE_SLEEP_SECONDS` - pause between ingestion cycles (seconds).
-- `POSTGRES_*` - connection settings for Postgres (optional, used for station catalog).
+- `POSTGRES_*` - connection settings for Postgres (optional, used for station catalog). Set `POSTGRES_SSLMODE=require` if you're pointing at a managed service such as Supabase.
 - `PIPELINE_DE_*`, `PIPELINE_NL_*`, `PIPELINE_PL_*` - base URLs and filters for each country (see `.env.example`).
 
 ## Docker

@@ -56,7 +56,7 @@ def _get_stations_from_db(source: str) -> List[Dict[str, Any]]:
 
 
 def _get_db_conn():
-    return psycopg.connect(
+    conn_kwargs = dict(
         host=settings.db_host,
         port=settings.db_port,
         dbname=settings.db_name,
@@ -64,6 +64,9 @@ def _get_db_conn():
         password=settings.db_password,
         autocommit=True,
     )
+    if settings.db_sslmode:
+        conn_kwargs["sslmode"] = settings.db_sslmode
+    return psycopg.connect(**conn_kwargs)
 
 
 def _build_producer() -> KafkaProducer | None:
@@ -423,15 +426,14 @@ def _upsert_catalog(stations: List[Dict[str, Any]]) -> None:
     if not stations:
         return
     sql = """
-    INSERT INTO stations (station_id, source, country, city, location_name, lat, lon, updated_at)
-    VALUES (%(station_id)s, %(source)s, %(country)s, %(city)s, %(location_name)s, %(lat)s, %(lon)s, now())
-    ON CONFLICT (station_id, source) DO UPDATE
+    INSERT INTO stations (station_id, source, country, city, location_name, lat, lon)
+    VALUES (%(station_id)s, %(source)s, %(country)s, %(city)s, %(location_name)s, %(lat)s, %(lon)s)
+    ON CONFLICT (station_id) DO UPDATE
       SET country = COALESCE(EXCLUDED.country, stations.country),
           city = COALESCE(EXCLUDED.city, stations.city),
           location_name = COALESCE(EXCLUDED.location_name, stations.location_name),
           lat = COALESCE(EXCLUDED.lat, stations.lat),
-          lon = COALESCE(EXCLUDED.lon, stations.lon),
-          updated_at = now();
+          lon = COALESCE(EXCLUDED.lon, stations.lon);
     """
     with _get_db_conn() as conn, conn.cursor() as cur:
         cur.executemany(sql, stations)
@@ -1021,7 +1023,12 @@ def run() -> None:
     else:
         LOGGER.info("PL catalog refresh skipped (PIPELINE_DISABLE_PL=true)")
     if catalog:
-        _upsert_catalog(catalog)
+        try:
+            _upsert_catalog(catalog)
+        except Exception:
+            LOGGER.exception(
+                "Failed to upsert station catalog; continuing without DB write"
+            )
     else:
         LOGGER.warning("Catalog refresh produced 0 stations")
 

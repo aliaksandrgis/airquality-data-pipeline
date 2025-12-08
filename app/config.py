@@ -21,6 +21,7 @@ class Settings:
     db_name: str = os.getenv("POSTGRES_DB", "airquality")
     db_user: str = os.getenv("POSTGRES_USER", "airuser")
     db_password: str = os.getenv("POSTGRES_PASSWORD", "airpassword")
+    db_sslmode: str = os.getenv("POSTGRES_SSLMODE", "")
     # DE (Germany, formerly UBA) settings
     de_base_url: str = os.getenv(
         "PIPELINE_DE_BASE_URL", "https://www.umweltbundesamt.de/api/air_data/v2"
