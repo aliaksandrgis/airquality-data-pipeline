@@ -9,6 +9,31 @@ from typing import Any, Dict, List
 
 import requests
 import psycopg
+
+# kafka-python vendored six (1.11.0) exposes only find_module which broke in Py3.13.
+# Patch its meta importer to implement find_spec before importing KafkaProducer.
+try:
+    import importlib.util
+    import sys
+    import kafka.vendor.six as kafka_six  # type: ignore[attr-defined]
+
+    if not hasattr(kafka_six._SixMetaPathImporter, "find_spec"):  # pragma: no cover
+        def _find_spec(self, fullname: str, path=None, target=None):
+            if fullname in self.known_modules:
+                return importlib.util.spec_from_loader(fullname, self)
+            return None
+
+        kafka_six._SixMetaPathImporter.find_spec = _find_spec  # type: ignore[attr-defined]
+
+    # Ensure moves submodule is already registered so importlib doesn't go through broken loader.
+    if "kafka.vendor.six.moves" not in sys.modules:
+        sys.modules["kafka.vendor.six.moves"] = kafka_six.moves  # type: ignore[attr-defined]
+    if "kafka.vendor.six" not in sys.modules:
+        sys.modules["kafka.vendor.six"] = kafka_six
+except Exception:
+    # If kafka isn't installed yet or already patched, just continue.
+    pass
+
 from kafka import KafkaProducer
 from kafka.errors import KafkaError, NoBrokersAvailable
 
