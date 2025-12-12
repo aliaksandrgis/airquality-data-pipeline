@@ -5,7 +5,7 @@ import logging
 import random
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import requests
 import psycopg
@@ -51,6 +51,8 @@ LOGGER = logging.getLogger("pipeline")
 _de_station_cache: Dict[str, Dict[str, Any]] = {}
 _nl_station_cache: Dict[str, Dict[str, Any]] = {}
 _pl_station_cache: Dict[str, Dict[str, Any]] = {}
+_cursor_cache: Dict[str, Dict[Tuple[str, str], datetime]] = {}
+_cursor_table_ready = False
 
 
 NL_DEFAULT_STATIONS: List[str] = ["NL01491"]
@@ -94,6 +96,145 @@ def _get_db_conn():
     if settings.db_sslmode:
         conn_kwargs["sslmode"] = settings.db_sslmode
     return psycopg.connect(**conn_kwargs)
+
+
+def _ensure_cursor_table() -> bool:
+    global _cursor_table_ready
+    if _cursor_table_ready:
+        return True
+    try:
+        with _get_db_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ingestion_cursors (
+                    source TEXT NOT NULL,
+                    station_id TEXT NOT NULL,
+                    pollutant TEXT NOT NULL,
+                    last_observed_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (source, station_id, pollutant)
+                )
+                """
+            )
+        _cursor_table_ready = True
+        return True
+    except Exception:
+        LOGGER.warning(
+            "Unable to ensure ingestion_cursors table; deduplication will be skipped",
+            exc_info=True,
+        )
+        return False
+
+
+def _get_cursor_map(source: str) -> Dict[Tuple[str, str], datetime] | None:
+    if not _ensure_cursor_table():
+        return None
+    if source in _cursor_cache:
+        return _cursor_cache[source]
+    cursor_map: Dict[Tuple[str, str], datetime] = {}
+    try:
+        with _get_db_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT station_id, pollutant, last_observed_at
+                FROM ingestion_cursors
+                WHERE source = %s
+                """,
+                (source,),
+            )
+            for station_id, pollutant, last_observed_at in cur.fetchall():
+                if station_id is None or pollutant is None or last_observed_at is None:
+                    continue
+                cursor_map[(str(station_id), str(pollutant))] = last_observed_at
+    except Exception:
+        LOGGER.warning("Failed to load ingestion cursors for %s", source, exc_info=True)
+        return None
+    _cursor_cache[source] = cursor_map
+    return cursor_map
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str):
+        ts_str = value.strip()
+        if not ts_str:
+            return None
+        if ts_str.endswith("Z"):
+            ts_str = ts_str[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(ts_str)
+        except ValueError:
+            return None
+    return None
+
+
+def _filter_new_measurements(
+    source: str, data: List[Dict[str, Any]]
+) -> tuple[List[Dict[str, Any]], Dict[Tuple[str, str], datetime]]:
+    cursor_map = _get_cursor_map(source)
+    if cursor_map is None:
+        return data, {}
+    filtered: List[Dict[str, Any]] = []
+    updates: Dict[Tuple[str, str], datetime] = {}
+    for record in data:
+        station = record.get("station_id")
+        pollutant = record.get("pollutant")
+        ts_value = record.get("timestamp")
+        parsed_ts = _parse_timestamp(ts_value)
+        if (
+            station is None
+            or pollutant is None
+            or parsed_ts is None
+            or isinstance(station, dict)
+            or isinstance(pollutant, dict)
+        ):
+            filtered.append(record)
+            continue
+        key = (str(station), str(pollutant))
+        last_known = updates.get(key) or cursor_map.get(key)
+        if last_known is None or parsed_ts > last_known:
+            filtered.append(record)
+            updates[key] = parsed_ts
+    return filtered, updates
+
+
+def _commit_cursor_updates(
+    pending_updates: Dict[str, Dict[Tuple[str, str], datetime]]
+) -> None:
+    if not pending_updates or not _ensure_cursor_table():
+        return
+    try:
+        with _get_db_conn() as conn, conn.cursor() as cur:
+            for source, updates in pending_updates.items():
+                if not updates:
+                    continue
+                values = [
+                    (source, key[0], key[1], ts) for key, ts in updates.items() if ts
+                ]
+                if not values:
+                    continue
+                cur.executemany(
+                    """
+                    INSERT INTO ingestion_cursors (
+                        source, station_id, pollutant, last_observed_at
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (source, station_id, pollutant)
+                    DO UPDATE SET last_observed_at = GREATEST(
+                        ingestion_cursors.last_observed_at,
+                        EXCLUDED.last_observed_at
+                    )
+                    """,
+                    values,
+                )
+                cursor_map = _cursor_cache.setdefault(source, {})
+                for key, ts in updates.items():
+                    if ts:
+                        cursor_map[key] = ts
+    except Exception:
+        LOGGER.warning("Failed to persist ingestion cursors", exc_info=True)
 
 
 def _build_producer() -> KafkaProducer | None:
@@ -1062,6 +1203,7 @@ def run() -> None:
     producer = _build_producer()
     while True:
         cycle_started = time.monotonic()
+        pending_cursor_updates: Dict[str, Dict[Tuple[str, str], datetime]] = {}
         if producer is None:
             producer = _build_producer()
             if producer is None:
@@ -1080,6 +1222,15 @@ def run() -> None:
                 try:
                     LOGGER.info("Fetching DE measurements...")
                     de_data = _fetch_de_latest()
+                    before = len(de_data)
+                    de_data, cursor_updates = _filter_new_measurements("de", de_data)
+                    LOGGER.info(
+                        "Filtered DE measurements %s -> %s (dedup)",
+                        before,
+                        len(de_data),
+                    )
+                    if cursor_updates:
+                        pending_cursor_updates["de"] = cursor_updates
                 except Exception:
                     LOGGER.exception("DE fetch failed; skipping DE this cycle")
             if settings.disable_nl_fetch:
@@ -1088,6 +1239,17 @@ def run() -> None:
                 try:
                     LOGGER.info("Fetching NL measurements...")
                     nl_data = _fetch_lucht_latest(request_counter)
+                    before = len(nl_data)
+                    nl_data, cursor_updates = _filter_new_measurements(
+                        "luchtmeetnet", nl_data
+                    )
+                    LOGGER.info(
+                        "Filtered NL measurements %s -> %s (dedup)",
+                        before,
+                        len(nl_data),
+                    )
+                    if cursor_updates:
+                        pending_cursor_updates["luchtmeetnet"] = cursor_updates
                 except Exception:
                     LOGGER.exception("NL fetch failed; skipping NL this cycle")
             if settings.disable_pl_fetch:
@@ -1096,6 +1258,15 @@ def run() -> None:
                 try:
                     LOGGER.info("Fetching PL measurements...")
                     pl_data = _fetch_gios_latest()
+                    before = len(pl_data)
+                    pl_data, cursor_updates = _filter_new_measurements("gios", pl_data)
+                    LOGGER.info(
+                        "Filtered PL measurements %s -> %s (dedup)",
+                        before,
+                        len(pl_data),
+                    )
+                    if cursor_updates:
+                        pending_cursor_updates["gios"] = cursor_updates
                 except Exception:
                     LOGGER.exception("PL fetch failed; skipping PL this cycle")
 
@@ -1125,6 +1296,8 @@ def run() -> None:
             _emit_batch(producer, payload)
         except Exception:
             LOGGER.exception("Failed to emit batch")
+        else:
+            _commit_cursor_updates(pending_cursor_updates)
         cycle_duration = time.monotonic() - cycle_started
         LOGGER.info(
             "Ingestion cycle completed in %.2f seconds (sleep %.0f seconds)",

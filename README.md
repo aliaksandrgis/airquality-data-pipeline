@@ -66,3 +66,59 @@ docker run --env-file .env airquality-data-pipeline:dev
 ## Structure
 - `app/` - pipeline logic (`config.py`, `main.py`, country-specific entrypoints).
 - `tests/` - unit tests (can be added as needed).
+
+## Kafka deduplication & backlog cleanup
+
+The producer now keeps track of the freshest timestamp per measurement using the
+`ingestion_cursors` table in Supabase/Postgres:
+
+```sql
+CREATE TABLE IF NOT EXISTS public.ingestion_cursors (
+    source TEXT NOT NULL,
+    station_id TEXT NOT NULL,
+    pollutant TEXT NOT NULL,
+    last_observed_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source, station_id, pollutant)
+);
+```
+
+During each loop `app.main`:
+
+1. Loads cursor values for the current source (DE/NL/PL).
+2. Drops records whose `observed_at` is not newer than the stored cursor.
+3. After a successful Kafka publish updates the cursor table with the latest
+   timestamp per `(source, station_id, pollutant)`.
+
+To verify that deduplication works:
+
+```sql
+SELECT source, station_id, pollutant, last_observed_at
+FROM public.ingestion_cursors
+ORDER BY last_observed_at DESC
+LIMIT 20;
+```
+
+### Cleaning the Kafka backlog in Confluent Cloud
+
+1. On the Raspberry Pi stop both services so they do not write/read while the
+   topic is recreated:
+   ```bash
+   sudo systemctl stop airquality-producer
+   sudo systemctl stop airquality-live
+   ```
+2. In Confluent Cloud open *Topics → airquality.raw → Settings* and click
+   **Delete topic**, then create it again with the original settings (1
+   partition, cleanup policy `delete`, retention `1 day`).
+3. Start only the producer and monitor `logs/app_main.log`. You should see lines
+   such as `Filtered NL measurements 612 -> 214 (dedup)` and `Emitted N records
+   to airquality.raw`.
+4. Check the *Messages* and *Monitor* tabs for the topic. Production/consumption
+   per hour should reflect the small deduplicated batch and the consumer lag
+   should stay near zero.
+5. Once the topic looks healthy, start Spark again:
+   ```bash
+   sudo systemctl start airquality-live
+   ```
+
+This workflow keeps Confluent clean and ensures Supabase receives only the latest
+measurements while Kafka throughput stays predictable.

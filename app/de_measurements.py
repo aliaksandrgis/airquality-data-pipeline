@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from typing import Dict, List, Any
+from datetime import datetime
+from typing import Any, Dict, List, Tuple
 
 from .config import settings
 from .main import (
+    LOGGER,
     _build_producer,
+    _commit_cursor_updates,
     _emit_batch,
     _fetch_de_latest,
+    _filter_new_measurements,
     _prepare_batch,
-    LOGGER,
     _create_synthetic_measurements,
 )
 
@@ -22,13 +25,24 @@ def main() -> None:
         return
 
     payload: List[Dict[str, Any]]
+    pending_cursor_updates: Dict[str, Dict[Tuple[str, str], datetime]] = {}
     if settings.use_live_api:
         data = _fetch_de_latest()
-        LOGGER.info("Fetched %s DE measurements", len(data))
+        original_count = len(data)
+        LOGGER.info("Fetched %s DE measurements", original_count)
         if not data:
             LOGGER.warning("No DE data to emit")
             return
-        payload = data
+        filtered, cursor_updates = _filter_new_measurements("de", data)
+        LOGGER.info(
+            "Filtered DE measurements %s -> %s (dedup)", original_count, len(filtered)
+        )
+        if not filtered:
+            LOGGER.warning("No new DE data after deduplication; nothing to emit")
+            return
+        if cursor_updates:
+            pending_cursor_updates["de"] = cursor_updates
+        payload = filtered
     else:
         LOGGER.info("PIPELINE_LIVE_API=false, using synthetic data")
         payload = _create_synthetic_measurements()
@@ -37,7 +51,12 @@ def main() -> None:
     if not prepared:
         LOGGER.warning("Prepared batch is empty; nothing to emit for DE")
         return
-    _emit_batch(producer, prepared)
+    try:
+        _emit_batch(producer, prepared)
+    except Exception:
+        LOGGER.exception("Failed to emit DE measurements batch")
+    else:
+        _commit_cursor_updates(pending_cursor_updates)
 
 
 if __name__ == "__main__":
