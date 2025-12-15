@@ -125,6 +125,14 @@ def _ensure_cursor_table() -> bool:
         return False
 
 
+def _ensure_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _get_cursor_map(source: str) -> Dict[Tuple[str, str], datetime] | None:
     if not _ensure_cursor_table():
         return None
@@ -144,7 +152,9 @@ def _get_cursor_map(source: str) -> Dict[Tuple[str, str], datetime] | None:
             for station_id, pollutant, last_observed_at in cur.fetchall():
                 if station_id is None or pollutant is None or last_observed_at is None:
                     continue
-                cursor_map[(str(station_id), str(pollutant))] = last_observed_at
+                aware_ts = _ensure_utc(last_observed_at)
+                if aware_ts:
+                    cursor_map[(str(station_id), str(pollutant))] = aware_ts
     except Exception:
         LOGGER.warning("Failed to load ingestion cursors for %s", source, exc_info=True)
         return None
@@ -193,10 +203,10 @@ def _filter_new_measurements(
             filtered.append(record)
             continue
         key = (str(station), str(pollutant))
-        last_known = updates.get(key) or cursor_map.get(key)
+        last_known = _ensure_utc(updates.get(key)) or _ensure_utc(cursor_map.get(key))
         if last_known is None or parsed_ts > last_known:
             filtered.append(record)
-            updates[key] = parsed_ts
+            updates[key] = _ensure_utc(parsed_ts) or parsed_ts
     return filtered, updates
 
 
@@ -210,9 +220,11 @@ def _commit_cursor_updates(
             for source, updates in pending_updates.items():
                 if not updates:
                     continue
-                values = [
-                    (source, key[0], key[1], ts) for key, ts in updates.items() if ts
-                ]
+                values = []
+                for key, ts in updates.items():
+                    aware_ts = _ensure_utc(ts)
+                    if aware_ts:
+                        values.append((source, key[0], key[1], aware_ts))
                 if not values:
                     continue
                 cur.executemany(
@@ -231,8 +243,9 @@ def _commit_cursor_updates(
                 )
                 cursor_map = _cursor_cache.setdefault(source, {})
                 for key, ts in updates.items():
-                    if ts:
-                        cursor_map[key] = ts
+                    aware_ts = _ensure_utc(ts)
+                    if aware_ts:
+                        cursor_map[key] = aware_ts
     except Exception:
         LOGGER.warning("Failed to persist ingestion cursors", exc_info=True)
 
