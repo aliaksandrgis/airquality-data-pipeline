@@ -193,6 +193,7 @@ def _filter_new_measurements(
         pollutant = record.get("pollutant")
         ts_value = record.get("timestamp")
         parsed_ts = _parse_timestamp(ts_value)
+        parsed_ts = _ensure_utc(parsed_ts) or parsed_ts
         if (
             station is None
             or pollutant is None
