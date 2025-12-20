@@ -6,6 +6,7 @@ import random
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 import psycopg
@@ -178,6 +179,31 @@ def _parse_timestamp(value: Any) -> datetime | None:
         except ValueError:
             return None
     return None
+
+
+def _ensure_utc_assuming_local(dt: datetime | None, local_tz: str | None) -> datetime | None:
+    """Return dt converted to UTC.
+
+    Some upstream APIs (DE UBA, PL GIOS) return timestamps without timezone. In that
+    case we must treat the timestamp as local time for that country before converting
+    to UTC.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        if local_tz:
+            try:
+                dt = dt.replace(tzinfo=ZoneInfo(local_tz))
+            except ZoneInfoNotFoundError:
+                LOGGER.warning(
+                    "Timezone '%s' not found; assuming UTC for naive timestamp %s",
+                    local_tz,
+                    dt,
+                )
+                dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _filter_new_measurements(
@@ -673,7 +699,10 @@ def _fetch_de_latest() -> List[Dict[str, Any]]:
     """Fetch latest measures from UBA (DE) Air Data API for configured stations/components."""
 # For each station/component fetch hourly values for the day
     now = datetime.now(timezone.utc)
-    date_from = now.date().isoformat()
+    try:
+        date_from = now.astimezone(ZoneInfo("Europe/Berlin")).date().isoformat()
+    except ZoneInfoNotFoundError:
+        date_from = now.date().isoformat()
     date_to = date_from
     results: List[Dict[str, Any]] = []
     stations = _get_stations_from_db("de") or [{"station_id": s} for s in settings.de_stations]
@@ -723,9 +752,10 @@ def _fetch_de_latest() -> List[Dict[str, Any]]:
                 if value is None:
                     continue
                 try:
-                    ts_parsed = datetime.fromisoformat(ts_str).replace(
-                        tzinfo=timezone.utc
-                    )
+                    ts_parsed = _ensure_utc_assuming_local(
+                        datetime.fromisoformat(ts_str),
+                        "Europe/Berlin",
+                    ) or now
                 except ValueError:
                     ts_parsed = now
                 comp_map = {
@@ -1100,7 +1130,10 @@ def _fetch_gios_latest() -> List[Dict[str, Any]]:  # type: ignore[redefined-oute
                 if value is None:
                     continue
                 try:
-                    ts_parsed = datetime.fromisoformat(ts.replace(" ", "T"))
+                    ts_parsed = _ensure_utc_assuming_local(
+                        datetime.fromisoformat(ts.replace(" ", "T")),
+                        "Europe/Warsaw",
+                    ) or now
                 except Exception:
                     ts_parsed = now
                 results.append(
